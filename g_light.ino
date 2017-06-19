@@ -1,3 +1,12 @@
+#include <TM1638.h>
+#include <TM1638QYF.h>
+#include <TM16XX.h>
+#include <TM16XXFonts.h>
+
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+
 #include <Wire.h>
 #include "RTClib.h"
 #include <Adafruit_NeoPixel.h>
@@ -19,7 +28,7 @@ Adafruit_NeoPixel strip = Adafruit_NeoPixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GR
 #define BEDTIME_TIME_MINUTES 30
 #define SECONDS_BETWEEN_CHANGE (BEDTIME_TIME_MINUTES * 60) / INITIAL_BEDTIME_LEVEL
 
-#define WAKE_TIME (6UL * 60 * 60 + 45 * 60)
+#define WAKE_TIME (7UL * 60 * 60 + 0 * 60)
 #define WAKE_TIMESPAN (15 * 60)
 #define AWAKE_TIMESPAN (2 * 60 * 60)
 
@@ -76,6 +85,8 @@ state_t state = st_none;
 int16_t current_bedtime_level = 0;
 uint32_t next_change_seconds = 0;
 uint8_t awake_count = 0;
+TM1638 tm1638(8, 9, 10);
+DHT_Unified dht(3, DHT11);
 
 void setup () {
   // Buttons pull down; enable internal pullups
@@ -91,6 +102,8 @@ void setup () {
   strip.begin();
   strip.show(); // Initialize all pixels to 'off'
 
+  dht.begin();
+
   delay(1000); // wait for console opening
 
   if (!rtc.begin()) {
@@ -103,26 +116,12 @@ void setup () {
     // following line sets the RTC to the date & time this sketch was compiled
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
-    // Fade in/out red a few times to warn that clock will be incorrect
-    uint8_t level;
-    for (uint16_t count = 0; count < 10; count++) {
-      for (level = 0; level < 255; level++) {
-        for (uint8_t i = 0; i < strip.numPixels(); i++) {
-          strip.setPixelColor(i, strip.Color(level, 0, 0));
-          strip.show();
-          delay(1);
-        }
-      }
-      for (level = 255; level != 0; level--) {
-        for (uint8_t i = 0; i < strip.numPixels(); i++) {
-          strip.setPixelColor(i, strip.Color(level, 0, 0));
-          strip.show();
-          delay(1);
-        }
-      }
-    }
-  }
-
+    tm1638.clearDisplay();
+    tm1638.setDisplayToString("NO CLOCK");
+    delay(3000);
+  }  
+  
+  
   Serial.print("Seconds between change: ");
   Serial.print(SECONDS_BETWEEN_CHANGE);
   Serial.println();
@@ -131,9 +130,18 @@ void setup () {
   colorWipe(strip.Color(0, 0, 00), 133);
 }
 
+typedef enum {
+  time_e,
+  environ_e,
+  none_e
+} display_mode_t;
+
+display_mode_t display_mode = none_e;
+
 void loop () {
-  // left button: activate or cancel sleep mode
-  if (!digitalRead(4)) {
+  byte buttons = tm1638.getButtons();
+  
+  if (buttons & 1) { // button 1: activate or cancel sleep mode
     if (state == st_sleeping) {
       state = st_none;
       colorWipe(strip.Color(0, 0, 00), 133);
@@ -144,18 +152,49 @@ void loop () {
       next_change_seconds = rtc.now().secondstime() + SECONDS_BETWEEN_CHANGE;
       colorWipe(strip.Color(current_bedtime_level, 0, 0), 100);
     }
-    while (!digitalRead(4))
+    while (tm1638.getButtons() & 1)
       delay(1);
-  }
-
-  // right button: 5 cycles of rainbows
-  if (!digitalRead(5)) {
+  }  
+  else if (buttons & 2) { // button 2: 5 cycles of rainbows
     rainbowCycle(10, 5);
     colorWipe(strip.Color(0, 0, 0), 0);
   }
+  else if (buttons & 4) {
+    display_mode = time_e;
+  }
+  else if (buttons & 8) {
+    display_mode = environ_e;
+  }
+  else if (buttons & 16) {
+    tm1638.clearDisplay();
+    display_mode = none_e;
+  }
 
   if ((loop_counter % RTC_CHECK_COUNTER) == 0) {
-    uint32_t now_seconds = rtc.now().secondstime();
+    DateTime now = rtc.now();
+
+    if (display_mode == time_e) {
+      tm1638.setDisplayToDecNumber(now.hour() * 10000UL + now.minute() * 100 + now.second(), 1 << 4 | 1 << 2, false);
+    }
+    else if (display_mode == environ_e) {
+      sensors_event_t event;  
+      dht.temperature().getEvent(&event);
+      if (!isnan(event.temperature)) {
+        tm1638.setDisplayDigit((int)event.temperature % 10, 7, 0, NUMBER_FONT);
+        tm1638.setDisplayDigit(((int)(event.temperature / 10)) % 10, 6, 0, NUMBER_FONT);
+      }
+
+      dht.humidity().getEvent(&event);
+      if (isnan(event.relative_humidity)) {
+        Serial.println("Error reading humidity!");
+      }
+      else {
+        tm1638.setDisplayDigit((int)event.relative_humidity % 10, 1, 0, NUMBER_FONT);
+        tm1638.setDisplayDigit(((int)(event.relative_humidity / 10)) % 10, 0, 0, NUMBER_FONT);
+      }
+    }
+
+    uint32_t now_seconds = now.secondstime();
 
     if (now_seconds >= next_change_seconds)
       switch (state) {
@@ -193,21 +232,6 @@ void loop () {
           break;
 
         case st_none:
-#if 0
-          Serial.print("now ");
-          Serial.print(now_seconds);
-          Serial.print(" time ");
-          Serial.print(now_seconds % 86400UL);
-          Serial.print("\nwake_time ");
-          Serial.print(WAKE_TIME);
-          Serial.print("\nFFS:");
-          Serial.print(now.hour());
-          Serial.print(":");
-          Serial.print(now.minute());
-          Serial.print(":");
-          Serial.print(now.second());
-          Serial.println();
-#endif
           if (now_seconds % 86400 > WAKE_TIME - WAKE_TIMESPAN && now_seconds % 86400 < WAKE_TIME + AWAKE_TIMESPAN) {
             state = st_waking;
             awake_count = 0;
